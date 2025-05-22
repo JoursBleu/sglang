@@ -2,6 +2,7 @@ import logging
 from typing import Callable, List, Optional, Tuple
 
 import torch
+import os
 from torch.nn import Module
 
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
@@ -166,6 +167,7 @@ class EPMoE(torch.nn.Module):
         self.end_expert_id = self.start_expert_id + self.num_experts_per_partition - 1
 
         self.top_k = top_k
+        self.top_p = float(os.environ['LPEX_TOP_P']) if 'LPEX_TOP_P' in os.environ else None
         self.intermediate_size = intermediate_size
         self.renormalize = renormalize
         self.use_grouped_topk = use_grouped_topk
@@ -229,11 +231,17 @@ class EPMoE(torch.nn.Module):
             correction_bias=self.correction_bias,
             custom_routing_function=self.custom_routing_function,
             routed_scaling_factor=self.routed_scaling_factor,
+            topp=self.top_p
         )
 
         reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
             topk_ids, self.num_experts
         )
+        print(f"topk_weights: shape: {topk_weights.shape}, data: {topk_weights}")
+        print(f"topk_ids: shape: {topk_ids.shape}, data: {topk_ids}")
+        print(f"reorder_topk_ids: shape: {reorder_topk_ids.shape}, data: {reorder_topk_ids}")
+        print(f"src2dst: shape: {src2dst.shape}, data: {src2dst}")
+        print(f"seg_indptr: shape: {seg_indptr.shape}, data: {seg_indptr}")
 
         gateup_input = torch.empty(
             (int(hidden_states.shape[0] * self.top_k), hidden_states.shape[1]),

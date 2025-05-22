@@ -151,6 +151,7 @@ def biased_grouped_topk_impl(
     topk_group: int = 0,
     n_share_experts_fusion: int = 0,
     routed_scaling_factor: Optional[float] = None,
+    topp: Optional[float] = None,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -176,8 +177,15 @@ def biased_grouped_topk_impl(
     tmp_scores = scores_for_choice.masked_fill(
         ~score_mask.bool(), float("-inf")
     )  # [n, e]
-    _, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)
+    _, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=True)
     topk_weights = scores.gather(1, topk_ids)
+    
+    if topp != None:
+        weight_cumulative_sum = torch.cumsum(topk_weights, dim=-1)
+        mask = topk_weights.new_zeros(topk_weights.shape[0], topk_weights.shape[1]+1, dtype=torch.bool)
+        mask[:, 1:] = weight_cumulative_sum > topp
+        topk_weights[mask[:, :-1]] = 0
+        topk_ids[mask[:, :-1]] = -1
 
     if n_share_experts_fusion:
         topk_ids[:, -1] = torch.randint(
@@ -215,6 +223,7 @@ def biased_grouped_topk(
     compiled: bool = True,
     n_share_experts_fusion: int = 0,
     routed_scaling_factor: Optional[float] = None,
+    topp: Optional[float] = None,
 ):
     assert (
         routed_scaling_factor is not None
@@ -225,6 +234,7 @@ def biased_grouped_topk(
         and gating_output.shape[1] // num_expert_group
         <= 32  # moe_fused_gate kernel ensure that num_experts/num_expert_group does not exceed MAX_VPT=32 now. And when kernel can handle MAX_VPT > 32, we can remove this assertion.
         and is_power_of_two(correction_bias.shape[0])
+        and topp == None
     ):
         return moe_fused_gate(
             gating_output,
@@ -253,6 +263,7 @@ def biased_grouped_topk(
             topk_group,
             n_share_experts_fusion=n_share_experts_fusion,
             routed_scaling_factor=routed_scaling_factor,
+            topp=topp
         )
 
 
@@ -268,13 +279,14 @@ def select_experts(
     correction_bias: Optional[torch.Tensor] = None,
     torch_native: bool = False,
     routed_scaling_factor: Optional[float] = None,
+    top_p: Optional[float] = None
 ):
     n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
     # DeepSeek V2/V3/R1 series models use grouped_top_k
     if use_grouped_topk:
         assert topk_group is not None
         assert num_expert_group is not None
-        if correction_bias is None:
+        if correction_bias is None and top_p == None:
             topk_weights, topk_ids = grouped_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -296,6 +308,7 @@ def select_experts(
                 topk_group=topk_group,
                 n_share_experts_fusion=n_share_experts_fusion,
                 routed_scaling_factor=routed_scaling_factor,
+                topp=top_p
             )
     elif torch_native and custom_routing_function is None:
         topk_weights, topk_ids = fused_topk_native(

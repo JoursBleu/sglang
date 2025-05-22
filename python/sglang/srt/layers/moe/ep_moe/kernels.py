@@ -151,6 +151,14 @@ def compute_seg_indptr_triton_kernel(reorder_topk_ids, seg_indptr, num_toks):
 
 
 def run_moe_ep_preproess(topk_ids: torch.Tensor, num_experts: int):
+    # top-p mask
+    # flat_ids = topk_ids.view(-1)
+    # mask = flat_ids >= 0
+    # valid_ids  = flat_ids[mask]
+    # valid_pos  = torch.nonzero(mask, as_tuple=True)[0]
+    # sorted_ids, sort_idx = torch.sort(valid_ids, stable=True)
+    # reorder_topk_ids = sorted_ids
+    # reorder_ids  = valid_pos[sort_idx]
     reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
     seg_indptr = torch.zeros(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
     src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
