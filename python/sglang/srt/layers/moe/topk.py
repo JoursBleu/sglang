@@ -61,6 +61,7 @@ def fused_topk(
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
+    topp: Optional[float] = None,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -81,6 +82,13 @@ def fused_topk(
         gating_output.float(),
     )
     del token_expert_indicies
+
+    if topp != None:
+        weight_cumulative_sum = torch.cumsum(topk_weights, dim=-1)
+        mask = topk_weights.new_zeros(topk_weights.shape[0], topk_weights.shape[1]+1, dtype=torch.bool)
+        mask[:, 1:] = weight_cumulative_sum > topp
+        topk_weights[mask[:, :-1]] = 0
+        topk_ids[mask[:, :-1]] = -1
 
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
@@ -179,9 +187,16 @@ def biased_grouped_topk_impl(
     )  # [n, e]
     _, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=True)
     topk_weights = scores.gather(1, topk_ids)
-    
+    #print(f"topk_weights_, shape: {topk_weights.shape}, data: {topk_weights.data}")
+    #print(f"topk_ids_, shape: {topk_ids.shape}, data: {topk_ids.data}")
     if topp != None:
-        weight_cumulative_sum = torch.cumsum(topk_weights, dim=-1)
+        topk_weights_sum = (
+            topk_weights.sum(dim=-1, keepdim=True)
+            if n_share_experts_fusion == 0
+            else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+        )
+        topk_weights_ = topk_weights / topk_weights_sum
+        weight_cumulative_sum = torch.cumsum(topk_weights_, dim=-1)
         mask = topk_weights.new_zeros(topk_weights.shape[0], topk_weights.shape[1]+1, dtype=torch.bool)
         mask[:, 1:] = weight_cumulative_sum > topp
         topk_weights[mask[:, :-1]] = 0
@@ -196,6 +211,8 @@ def biased_grouped_topk_impl(
             device=topk_ids.device,
         )
         topk_weights[:, -1] = topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
+    #print(f"topk_weights_0, shape: {topk_weights.shape}, data: {topk_weights.data}")
+    #print(f"topk_ids_0, shape: {topk_ids.shape}, data: {topk_ids.data}")
 
     if renormalize:
         topk_weights_sum = (
@@ -286,7 +303,7 @@ def select_experts(
     if use_grouped_topk:
         assert topk_group is not None
         assert num_expert_group is not None
-        if correction_bias is None and top_p == None:
+        if correction_bias is None:
             topk_weights, topk_ids = grouped_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -323,6 +340,7 @@ def select_experts(
             gating_output=router_logits,
             topk=top_k,
             renormalize=renormalize,
+            topp=top_p
         )
     else:
         topk_weights, topk_ids = custom_routing_function(

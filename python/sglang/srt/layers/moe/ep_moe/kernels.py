@@ -158,8 +158,10 @@ def run_moe_ep_preproess(topk_ids: torch.Tensor, num_experts: int):
     compute_seg_indptr_triton_kernel[(num_experts,)](
         reorder_topk_ids, seg_indptr, topk_ids.numel()
     )
-    num_invalid = int((reorder_topk_ids < 0).sum().item())
-    seg_indptr[0] = num_invalid
+    #num_invalid = int((reorder_topk_ids < 0).sum().item())
+    #seg_indptr[0] = num_invalid
+    num_invalid = (reorder_topk_ids < 0).sum(dtype=torch.int64)
+    seg_indptr[:1].copy_(num_invalid)
     
     BLOCK_SIZE = 512
     grid = (triton.cdiv(topk_ids.numel(), BLOCK_SIZE),)
