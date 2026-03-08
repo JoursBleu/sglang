@@ -22,6 +22,8 @@ from sglang.srt.layers.quantization.quark.schemes import (
     QuarkW4A4MXFp4MoE,
     QuarkW8A8Fp8,
     QuarkW8A8FP8MoE,
+    QuarkW8A8Int8,
+    QuarkW8A8Int8MoE,
 )
 from sglang.srt.layers.quantization.quark.utils import deep_compare, should_ignore_layer
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
@@ -37,7 +39,6 @@ logger = logging.getLogger(__name__)
 
 
 class QuarkConfig(QuantizationConfig):
-
     def __init__(
         self,
         quant_config: dict[str, Any],
@@ -224,6 +225,45 @@ class QuarkConfig(QuantizationConfig):
         is_per_tensor_activation = input_quant.get("qscheme") == "per_tensor"
         return is_per_tensor_activation
 
+    def _is_int8_w8a8(
+        self,
+        weight_quant: Optional[dict[str, Any]],
+        input_quant: Optional[dict[str, Any]],
+    ) -> bool:
+        """Detect W8A8 INT8 quantization.
+
+        Supports per-channel or per-tensor static weight with
+        dynamic per-token or static per-tensor input quantization.
+        """
+        if weight_quant is None or input_quant is None:
+            return False
+
+        is_int8_dtype = (
+            weight_quant.get("dtype") == "int8" and input_quant.get("dtype") == "int8"
+        )
+        is_static_weight = not weight_quant.get("is_dynamic")
+        is_per_tensor_or_channel_weight = weight_quant.get("qscheme") in [
+            "per_tensor",
+            "per_channel",
+        ]
+        is_weight_symmetric = weight_quant.get("symmetric") is True
+
+        if not (
+            is_int8_dtype
+            and is_static_weight
+            and is_per_tensor_or_channel_weight
+            and is_weight_symmetric
+        ):
+            return False
+
+        # Dynamic quantization is always supported.
+        if input_quant.get("is_dynamic"):
+            return True
+
+        # Static per-tensor input is also supported.
+        is_per_tensor_activation = input_quant.get("qscheme") == "per_tensor"
+        return is_per_tensor_activation
+
     def _is_mx_fp4(
         self,
         weight_quant: Optional[dict[str, Any]],
@@ -338,6 +378,8 @@ class QuarkConfig(QuantizationConfig):
             )
             if is_fp8_w8a8_supported:
                 return QuarkW8A8Fp8(weight_config, input_config)
+        if self._is_int8_w8a8(weight_config, input_config):
+            return QuarkW8A8Int8(weight_config, input_config)
 
         raise NotImplementedError(
             "No quark compatible scheme was found. "
@@ -380,6 +422,8 @@ class QuarkConfig(QuantizationConfig):
             return QuarkW4A4MXFp4MoE(weight_config, input_config)
         elif self._is_fp8_w8a8(weight_config, input_config):
             return QuarkW8A8FP8MoE(weight_config, input_config)
+        elif self._is_int8_w8a8(weight_config, input_config):
+            return QuarkW8A8Int8MoE(weight_config, input_config)
         else:
             raise RuntimeError("Unsupported FusedMoe scheme")
 
@@ -388,7 +432,6 @@ class QuarkConfig(QuantizationConfig):
 
 
 class QuarkLinearMethod(LinearMethodBase):
-
     def __init__(self, quantization_config: QuarkConfig):
         self.quantization_config = quantization_config
 
@@ -440,7 +483,6 @@ class QuarkLinearMethod(LinearMethodBase):
 
 
 class QuarkFusedMoEMethod(FusedMoEMethodBase):
-
     def __init__(self, quantization_config: QuarkConfig):
         self.quantization_config = quantization_config
 
