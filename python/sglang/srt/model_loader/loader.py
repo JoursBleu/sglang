@@ -677,6 +677,53 @@ class DefaultModelLoader(BaseModelLoader):
                     quant_config,
                 )
 
+            tp_size = get_tensor_model_parallel_world_size()
+            tp_rank = get_tensor_model_parallel_rank()
+            use_preload = (
+                tp_size > 1
+                and os.environ.get('SGLANG_PRELOAD_PAGE_CACHE', '1') == '1'
+            )
+
+            if use_preload:
+                # Parallel page-cache warmup: each TP rank sequentially reads a
+                # disjoint subset of checkpoint files, then a barrier ensures the
+                # entire checkpoint is in the kernel page cache BEFORE any rank
+                # starts mmap-based weight loading. This eliminates the mmap
+                # page-fault contention that causes TP0/TP7 to be 14x slower
+                # on multi-socket systems with large models (e.g., DeepSeek-R1).
+                from sglang.srt.distributed import get_tp_group
+                import time as _time
+
+                hf_folder, hf_weights_files, _use_st = self._prepare_weights(
+                    model_config.model_path, model_config.revision,
+                    fall_back_to_pt=True,
+                )
+
+                # Partition files across ranks for parallel pre-reading
+                n_files = len(hf_weights_files)
+                chunk = (n_files + tp_size - 1) // tp_size
+                my_start = tp_rank * chunk
+                my_end = min(my_start + chunk, n_files)
+                my_files = hf_weights_files[my_start:my_end]
+
+                logger.info(
+                    '[preload] Rank %d: reading %d/%d files into page cache ...',
+                    tp_rank, len(my_files), n_files,
+                )
+                _t0 = _time.perf_counter()
+                for fpath in my_files:
+                    with open(fpath, 'rb', buffering=0) as _fp:
+                        while _fp.readinto(bytearray(8 * 1024 * 1024)):
+                            pass
+                _dt = _time.perf_counter() - _t0
+                _gb = sum(os.path.getsize(f) for f in my_files) / (1024**3)
+                logger.info(
+                    '[preload] Rank %d: done %.1f GB in %.1f s (%.2f GB/s)',
+                    tp_rank, _gb, _dt, _gb / max(_dt, 0.001),
+                )
+                get_tp_group().barrier()
+
+            # Normal weight loading (page cache is now warm if preloaded)
             self.load_weights_and_postprocess(
                 model, self._get_all_weights(model_config, model), target_device
             )

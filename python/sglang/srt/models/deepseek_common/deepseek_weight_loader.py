@@ -142,7 +142,12 @@ class DeepseekV2WeightLoaderMixin:
             assert self.num_fused_shared_experts == 1
             log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
+        # Limit ThreadPoolExecutor workers to reduce mmap page fault contention
+        # across TP ranks. With 8 TP processes, unlimited threads (default 32)
+        # creates 256 concurrent page faults causing severe NUMA contention.
+        import os
+        _max_async_workers = int(os.environ.get("SGLANG_WEIGHT_LOAD_WORKERS", "8"))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=_max_async_workers) as executor:
             futures = []
             params_dict = dict(self.named_parameters())
             weight_names = []
