@@ -274,8 +274,16 @@ template <auto* f, size_t kMaxDynamicSMEM>
 void setup_kernel_smem_once(host::DebugInfo where = {}) {
   [[maybe_unused]]
   static const auto result = [] {
+#ifdef USE_ROCM
+    // PATCH(AMD): topk_v1.cuh was never ported to ROCm (topk_v2.cuh was). HIP
+    // hands out the whole 64 KiB LDS without the >48 KiB opt-in that
+    // cudaFuncSetAttribute exists for, so there is nothing to raise here.
+    static_assert(kMaxDynamicSMEM <= 64 * 1024, "gfx9 LDS is 64 KiB per workgroup");
+    return hipSuccess;
+#else
     const auto fptr = std::bit_cast<const void*>(f);
     return ::cudaFuncSetAttribute(fptr, ::cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
+#endif
   }();
   host::RuntimeDeviceCheck(result, where);
 }

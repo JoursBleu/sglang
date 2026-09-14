@@ -56,9 +56,54 @@ def topk_transform_paged(
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
     if is_hip_runtime():
-        torch.ops.sgl_kernel.deepseek_v4_topk_transform_512(
-            scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
+        # PATCH(AMD): neither v1 path exists on ROCm. The AOT kernel this used to
+        # call (sgl_kernel.deepseek_v4_topk_transform_512) is not in the build,
+        # and the JIT v1 kernel asks for 65540 B of dynamic shared memory -- more
+        # than gfx9's 64 KiB LDS. topk_v2 is ROCm-ported and matches v1's
+        # semantics (rows with seq_len <= topk take the sequential branch and
+        # never read the scores), but it writes one output per launch.
+        module = _jit_topk_v2_module()
+        # v2 does 16-byte vectorized score loads; the identity branch hands us a
+        # (batch, 1) placeholder whose row stride breaks that.
+        if scores.dim() == 2 and scores.stride(0) % 4:
+            padded = scores.new_empty(
+                (scores.shape[0], (scores.shape[1] + 3) // 4 * 4)
+            )
+            padded[:, : scores.shape[1]] = scores
+            scores = padded
+        # plan_topk_v2 allocates with new_empty and topk_plan only writes row 0
+        # when rows route to the cluster pool, so the uninitialised tail leaks in.
+        metadata = torch.zeros(
+            (seq_lens.shape[0] + 1, _PLAN_METADATA_INTS_PER_BATCH),
+            dtype=torch.int32,
+            device=seq_lens.device,
         )
+        module.topk_plan(seq_lens, metadata, 0)
+        if out_raw_indices is None:
+            module.topk_transform_paged(
+                scores, seq_lens, page_tables, out_page_indices, page_size, metadata
+            )
+            return
+        # v1 writes both outputs from one selection. v2 writes one per launch and
+        # is not reproducible across launches (the set matches torch.topk but the
+        # order does not), so calling it twice would hand the caller two
+        # *different* selections. Select once, then apply the page table here so
+        # both outputs describe the same rows.
+        module.topk_transform_paged(
+            scores, seq_lens, None, out_raw_indices, page_size, metadata
+        )
+        if page_tables is None:
+            out_page_indices.copy_(out_raw_indices)
+            return
+        cols = out_raw_indices.clamp_min(0).to(torch.int64)
+        pages = page_tables.to(torch.int64).gather(1, cols // page_size)
+        slots = pages * page_size + cols % page_size
+        out_page_indices.copy_(
+            torch.where(out_raw_indices >= 0, slots, slots.new_full((), -1)).to(
+                out_page_indices.dtype
+            )
+        )
+        return
     elif is_xpu():
         torch.ops.sgl_kernel.topk_transform(
             scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
