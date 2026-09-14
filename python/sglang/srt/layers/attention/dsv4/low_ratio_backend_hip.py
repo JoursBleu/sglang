@@ -332,7 +332,7 @@ def select_candidate_blocks_hip(
     rows, width = logits.shape
     device = logits.device
     num_blocks = _num_candidate_blocks(width, block_size)
-    use_aot = topk_blocks == _AOT_FAST_TOPK_K
+    use_aot = topk_blocks == _AOT_FAST_TOPK_K and not _use_torch_candidate_topk()
     scores = candidate_block_scores(
         logits, seq_lens, block_size=block_size, fill_tail=not use_aot
     )
@@ -352,7 +352,8 @@ def select_candidate_blocks_hip(
         ids = torch.empty((rows, topk_blocks), dtype=torch.int32, device=device)
         torch.ops.sgl_kernel.fast_topk(scores, ids, block_lens, None)
     else:
-        picked = scores.topk(min(topk_blocks, num_blocks), dim=-1)
+        kept = min(topk_blocks, num_blocks)
+        picked = scores.topk(kept, dim=-1)
         ids = picked.indices.to(torch.int32).masked_fill(
             picked.values == -torch.inf, -1
         )
@@ -511,6 +512,35 @@ def _indexer_inputs(layer, x, q_lora, pos):
     q_fp4, q_scale = pack_fp4_query_flydsl(q)
     weights = _indexer_head_weights(indexer, x)  # [T, H] bf16, already scaled
     return q_fp4, q_scale, weights
+
+
+# PATCH(AMD): the FlyDSL logits kernel below needs CDNA4's
+# v_mfma_scale_f32_16x16x128_f8f6f4, which gfx942 cannot even compile, and this
+# module exposes no env switch to route around it. Fall back to a Triton kernel
+# that computes the same `Indexer.scores` expression straight from bf16 q.
+@functools.lru_cache(maxsize=1)
+def _use_triton_mqa_logits() -> bool:
+    from sglang.srt.utils import is_gfx95_supported
+
+    return not is_gfx95_supported()
+
+
+# PATCH(AMD): torch.ops.sgl_kernel.fast_topk (sgl::dsa_topk, topk_hip.hip) segfaults
+# inside hipLaunchKernel on gfx942 even for clean synthetic input; level one falls back
+# to the torch.topk body, which carries the same contract and is equally capture-safe.
+@functools.lru_cache(maxsize=1)
+def _use_torch_candidate_topk() -> bool:
+    from sglang.srt.utils import is_gfx95_supported
+
+    return not is_gfx95_supported()
+
+
+def _indexer_inputs_bf16(layer, x, q_lora, pos):
+    """(bf16 query, head weights) -- fp4 packing only pays off on CDNA4."""
+    indexer = layer.indexer
+    assert indexer.n_local_heads == indexer.n_heads
+    q = indexer.queries(q_lora, layer.freqs_cis[pos])  # [T, H, 128]
+    return q, _indexer_head_weights(indexer, x)
 
 
 def build_low_ratio_decode_workspaces(
@@ -680,20 +710,51 @@ def low_ratio_index_topk_hip_decode(
             backend.candidate_masks = None
         two_level = False
 
-    q_fp4, q_scale, weights = _indexer_inputs(layer, x, q_lora, pos)
-    logits = aiter_fp4_paged_mqa_logits(
-        q_fp4=q_fp4,
-        q_scale=q_scale,
-        k_payload=pool.get_index_k_fp4_payload_buffer(layer.layer_id),
-        k_scale=pool.get_index_k_fp4_scale_buffer(layer.layer_id),
-        weights=weights,
-        page_table=indexer_metadata.page_table,
-        c4_seq_lens=indexer_metadata.c4_seq_lens,
-        weight_scale=1.0,
-        page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
-        is_decode=True,
-        decode_workspace=metadata.fp4_low_ratio_decode_workspaces.get(ratio),
-    )
+    if _use_triton_mqa_logits():
+        from sglang.kernels.ops.attention.dsv4.triton_mqa_logits_gfx942 import (
+            triton_paged_mqa_logits,
+        )
+
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+            _guard_page_table,
+        )
+
+        q_bf16, weights = _indexer_inputs_bf16(layer, x, q_lora, pos)
+        # The unguarded page table spans the whole pool (16388 pages = 1M columns
+        # here), so a logits rectangle over it would be hundreds of MB. Reuse the
+        # fp4 path's workspace / guard so the width tracks the real context.
+        ws = metadata.fp4_low_ratio_decode_workspaces.get(ratio)
+        if ws is not None and ws.guarded_page_table.shape[0] == q_bf16.shape[0]:
+            page_table, max_seq_len = ws.guarded_page_table, ws.max_seq_len
+        else:
+            page_table, max_seq_len = _guard_page_table(
+                indexer_metadata.page_table, bucket=LOW_RATIO_PAGE_TABLE_BUCKET
+            )
+        logits = triton_paged_mqa_logits(
+            q=q_bf16,
+            weights=weights,
+            k_payload=pool.get_index_k_fp4_payload_buffer(layer.layer_id),
+            k_scale=pool.get_index_k_fp4_scale_buffer(layer.layer_id),
+            page_table=page_table,
+            c4_seq_lens=indexer_metadata.c4_seq_lens,
+            max_seq_len=max_seq_len,
+            page_size=indexer_metadata.c4_page_size,
+        )
+    else:
+        q_fp4, q_scale, weights = _indexer_inputs(layer, x, q_lora, pos)
+        logits = aiter_fp4_paged_mqa_logits(
+            q_fp4=q_fp4,
+            q_scale=q_scale,
+            k_payload=pool.get_index_k_fp4_payload_buffer(layer.layer_id),
+            k_scale=pool.get_index_k_fp4_scale_buffer(layer.layer_id),
+            weights=weights,
+            page_table=indexer_metadata.page_table,
+            c4_seq_lens=indexer_metadata.c4_seq_lens,
+            weight_scale=1.0,
+            page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
+            is_decode=True,
+            decode_workspace=metadata.fp4_low_ratio_decode_workspaces.get(ratio),
+        )
     # level one is bounded on device by the compressed lengths: a captured step cannot read them back
     if two_level and indexer.uses_candidates:
         candidates = backend.candidate_masks
@@ -853,12 +914,50 @@ def low_ratio_index_topk_hip_extend(
     assert indexer_metadata is not None, f"no prefill indexer metadata for {ratio = }"
     num_tokens = pos.shape[0]
     assert indexer_metadata.page_table.shape[0] >= num_tokens
-    q_fp4, q_scale, weights = _indexer_inputs(layer, x, q_lora, pos)
+    if _use_triton_mqa_logits():
+        # PATCH(AMD): pack_fp4_query_flydsl is CDNA4-only; skip it entirely on gfx942
+        # instead of packing a query the Triton kernel never reads.
+        q_fp4 = q_scale = None
+        q_bf16, weights = _indexer_inputs_bf16(layer, x, q_lora, pos)
+    else:
+        q_fp4, q_scale, weights = _indexer_inputs(layer, x, q_lora, pos)
+        q_bf16 = None
     k_payload = pool.get_index_k_fp4_payload_buffer(layer.layer_id)
     k_scale = pool.get_index_k_fp4_scale_buffer(layer.layer_id)
     prefill_workspace = metadata.fp4_low_ratio_prefill_workspaces.get(ratio)
 
     def score_rows(rows: slice) -> torch.Tensor:
+        if q_bf16 is not None:
+            # PATCH(AMD): gfx942 has no FlyDSL fp4 kernel; score straight from bf16 q.
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+                _alloc_logits,
+                _guard_page_table,
+            )
+            from sglang.kernels.ops.attention.dsv4.triton_mqa_logits_gfx942 import (
+                triton_paged_mqa_logits,
+            )
+
+            pt_rows, max_seq_len = _guard_page_table(
+                indexer_metadata.page_table[rows],
+                bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
+            )
+            q_rows = q_bf16[rows]
+            return triton_paged_mqa_logits(
+                q=q_rows,
+                weights=weights[rows],
+                k_payload=k_payload,
+                k_scale=k_scale,
+                page_table=pt_rows,
+                c4_seq_lens=indexer_metadata.c4_seq_lens[rows],
+                max_seq_len=max_seq_len,
+                page_size=indexer_metadata.c4_page_size,
+                # The pooled block, for the reason `_alloc_logits` documents: a
+                # fresh rectangle per call fragments the heap until Triton
+                # scratch faults instead of raising a clean OOM.
+                out=_alloc_logits(
+                    q_rows.shape[0], max_seq_len, q_rows.device, is_decode=False
+                ),
+            )
         return aiter_fp4_paged_mqa_logits(
             q_fp4=q_fp4[rows],
             q_scale=q_scale[rows],
@@ -876,6 +975,7 @@ def low_ratio_index_topk_hip_extend(
     def select_rows(
         rows: slice, req_lo, req_hi, group_is_identity, consume_rows, publish
     ):
+
         _select_topk_extend_hip(
             indexer=indexer,
             logits=score_rows(rows),

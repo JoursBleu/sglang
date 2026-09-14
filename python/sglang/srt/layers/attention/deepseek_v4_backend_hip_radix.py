@@ -2492,10 +2492,12 @@ class DeepseekV4HipRadixBackend(
         self.forward_metadata.core_metadata.drop_folded_sparse_indices(
             layer.compress_ratio
         )
+        # PATCH(AMD): upstream only wires the torch oracle into the prefill
+        # branch, so gfx942 has no way past the FlyDSL fp4 decode kernel.
         if (
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
-        ):
+        ) and not envs.SGLANG_DSV41_TORCH_DECODE_INDEXER.get():
             low_ratio_index_topk_hip_decode(
                 self, layer, x, q_lora, pos, forward_batch=forward_batch
             )

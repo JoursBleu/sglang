@@ -1436,6 +1436,10 @@ class Envs:
     SGLANG_DSV41_DEEP_GEMM_CANDIDATE_INDEXER = EnvBool(False)
     # use multistream to overlap the publish-side with other computation
     SGLANG_DSV41_DEEP_GEMM_CANDIDATE_OVERLAP = EnvBool(True)
+    # PATCH(AMD): same torch oracle for decode. The FlyDSL fp4 decode
+    # indexer needs v_mfma_scale_f32_16x16x128_f8f6f4, which only CDNA4
+    # (gfx950) has -- on gfx942 the kernel fails to even compile.
+    SGLANG_DSV41_TORCH_DECODE_INDEXER = EnvBool(False)
     # Keep the DeepSeek-V4.1 engram tables in host memory (layout below) and gather
     # rows from the GPU instead of sharding them over HBM.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
