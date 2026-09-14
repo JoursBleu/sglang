@@ -405,7 +405,15 @@ class Fp8Config(QuantizationConfig):
             fp8_method = Fp8MoEMethod(self)
 
             if self.is_fp4_experts and self.dequant_fp4_to_fp8:
-                assert get_moe_runner_backend().is_auto(), (
+                # PATCH(AMD): after the dequant the experts are plain block-fp8,
+                # so the generic triton runner consumes them fine. gfx942 needs
+                # this escape hatch: aiter's ASM 1-stage kernel
+                # (fmoe_fp8_blockscale_g1u1) has no instance for DSV4.1's
+                # inter_dim=2304 -> "No suitable kernel found".
+                assert (
+                    get_moe_runner_backend().is_auto()
+                    or get_moe_runner_backend().is_triton()
+                ), (
                     f"{get_moe_runner_backend()} is not compatible with SGLANG_DSV4_FP4_DEQUANT=1"
                 )
                 return fp8_method
@@ -1656,6 +1664,47 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self._ensure_cutlass_buffers_initialized(layer)
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        # === PATCH(AMD): run the FP4->FP8 dequant before the aiter MXFP4 path. ===
+        # The `if _use_aiter and self.is_fp4_expert:` branch right below takes
+        # aiter's *native* MXFP4 MoE path and returns, without ever consulting
+        # `dequant_fp4_to_fp8`. That branch only works on gfx950: aiter's
+        # ck_gemm_moe_2stages_codegen/gen_instances.py wraps every FP4 instance in
+        # `#ifndef __gfx942__`, so on MI300X the heuristic dispatch table has no
+        # match and ck_moe_stage1 raises "Unsupported kernel config for moe
+        # heuristic dispatch". Upstream does wire SGLANG_DSV4_FP4_DEQUANT in, but
+        # only into the CUDA/DeepGEMM `else` branch further down, which ROCm can
+        # never reach -- so the flag is silently a no-op on gfx942.
+        #
+        # Dequantising here turns the experts into plain block-128 FP8, i.e. the
+        # exact layout the fnuz-normalise + aiter-shuffle path below already
+        # serves for DeepSeek-V4-Flash on gfx942 today.
+        if self.is_fp4_expert and self.dequant_fp4_to_fp8:
+            for weight_param, scale_param in [
+                (layer.w13_weight, layer.w13_weight_scale_inv),
+                (layer.w2_weight, layer.w2_weight_scale_inv),
+            ]:
+                num_experts = weight_param.shape[0]
+                new_weights = []
+                new_scales = []
+                for e in range(num_experts):
+                    w, s = cast_e2m1fn_to_e4m3fn(
+                        weight_param.data[e], scale_param.data[e]
+                    )
+                    new_weights.append(w)
+                    new_scales.append(s)
+                weight_param.data = torch.stack(new_weights)
+                scale_param.data = torch.stack(new_scales).float()
+                scale_param.format_ue8m0 = False
+            self.is_fp4_expert = False
+            # cast_e2m1fn_to_e4m3fn folds the per-1x32 MX scales into one scale
+            # per 128x128 tile, so the runner must be told the new block shape
+            # (mirrors _convert_mxfp8_moe_to_block_fp8).
+            self.weight_block_size = [128, 128]
+            logger.info(
+                "PATCH(AMD) dequantized MXFP4 experts -> FP8 block[128,128] "
+                "(gfx942 has no native FP4 CK MoE instances)."
+            )
+        # === end PATCH(AMD) ===
         # AMD FP4 experts: use aiter's native MXFP4 MoE path
         if _use_aiter and self.is_fp4_expert:
             gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
@@ -1860,7 +1909,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_weight_scale, requires_grad=False
             )
             layer.w2_input_scale = None
-            if _use_aiter:
+            # PATCH(AMD): the triton runner consumes un-shuffled weights;
+            # shuffling for the wrong runner corrupts the output (see the same
+            # guard in the convert_mxfp8_to_block branch above).
+            if _use_aiter and not get_moe_runner_backend().is_triton():
                 layer.w13_weight.data = shuffle_weight(
                     layer.w13_weight.contiguous(), (16, 16)
                 )

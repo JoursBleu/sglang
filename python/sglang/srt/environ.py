@@ -1407,6 +1407,10 @@ class Envs:
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # PATCH(AMD): same torch oracle for decode. The FlyDSL fp4 decode
+    # indexer needs v_mfma_scale_f32_16x16x128_f8f6f4, which only CDNA4
+    # (gfx950) has -- on gfx942 the kernel fails to even compile.
+    SGLANG_DSV41_TORCH_DECODE_INDEXER = EnvBool(False)
     # Keep the DeepSeek-V4.1 engram tables in host memory (layout below) and gather
     # rows from the GPU instead of sharding them over HBM.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
