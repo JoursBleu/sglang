@@ -778,7 +778,7 @@ RUN find /sgl-workspace/sglang/python/sglang/srt/layers/quantization/configs/ \
 
 # Build and install sgl-model-gateway
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends protobuf-compiler \
+    && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m pip install --no-cache-dir "maturin<1.14" \
     && sed -i -E 's|^(smg-[a-zA-Z-]+)\s*=\s*"~1\.0\.0"|\1 = "=1.0.0"|' \
