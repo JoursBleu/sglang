@@ -95,6 +95,310 @@ MiMoV2Config = None
 logger = logging.getLogger(__name__)
 
 
+def get_mimo_v2_fused_qkv_chunks(config, quant_config) -> int:
+    if not getattr(quant_config, "weight_block_size", None):
+        return 0
+    return get_mimo_v2_fused_qkv_expected_tp_size(config) or 0
+
+
+def _requantize_fp8(
+    grouped: torch.Tensor, rows_rank: int, block: int, dtype: torch.dtype
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    n_pad = ceil_align(rows_rank, block)
+    k_pad = ceil_align(grouped.shape[1], block)
+    padded = grouped.new_zeros((n_pad, k_pad))
+    padded[:rows_rank, : grouped.shape[1]] = grouped
+    blocks = padded.view(n_pad // block, block, k_pad // block, block)
+    amax = blocks.abs().float().amax(dim=(1, 3), keepdim=True).clamp(min=1e-12)
+    finfo = torch.finfo(dtype)
+    scale = amax / finfo.max
+    weight = (
+        (blocks.float() / scale)
+        .clamp(min=finfo.min, max=finfo.max)
+        .to(dtype)
+        .view(n_pad, k_pad)
+    )
+    return (
+        weight[:rows_rank, : grouped.shape[1]].contiguous(),
+        scale.view(n_pad // block, k_pad // block),
+    )
+
+
+def _fused_qkv_kv_chunk_rows(
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    v_head_dim: int,
+    tp_size: int,
+    ckpt_tp: int,
+    block: int = 128,
+) -> int:
+    if (
+        ckpt_tp <= tp_size
+        or ckpt_tp % tp_size
+        or num_heads % ckpt_tp
+        or num_kv_heads % ckpt_tp
+    ):
+        return 0
+    q_rows = num_heads // ckpt_tp * head_dim
+    k_rows = num_kv_heads // ckpt_tp * head_dim
+    v_rows = num_kv_heads // ckpt_tp * v_head_dim
+    if q_rows % block or (k_rows % block == 0 and v_rows % block == 0):
+        return 0
+    return ceil_align(k_rows + v_rows, block)
+
+
+def _split_qkv(
+    qkv: torch.Tensor,
+    q_size: int,
+    k_size: int,
+    v_size: int,
+    kv_chunk_rows: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not kv_chunk_rows:
+        return qkv.split([q_size, k_size, v_size], dim=-1)
+    q, kv = qkv.split([q_size, qkv.shape[-1] - q_size], dim=-1)
+    kv = kv.unflatten(-1, (-1, kv_chunk_rows))
+    k_rows = k_size // kv.shape[-2]
+    v_rows = v_size // kv.shape[-2]
+    k = kv[..., :k_rows].flatten(-2)
+    v = kv[..., k_rows : k_rows + v_rows].flatten(-2)
+    return q, k, v
+
+
+def _shard_fp8_qkv_proj(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    v_head_dim: int,
+    tp_rank: int,
+    tp_size: int,
+    ckpt_tp: int,
+    block: int = 128,
+    kv_chunk_rows: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if num_heads % tp_size:
+        raise ValueError(
+            f"num_heads={num_heads} must be divisible by tp_size={tp_size}."
+        )
+    if ckpt_tp <= 0 or num_heads % ckpt_tp or num_kv_heads % ckpt_tp:
+        raise ValueError(
+            f"fused qkv_proj is pre-sharded at {ckpt_tp} chunks, which do not "
+            f"divide num_heads={num_heads} / num_kv_heads={num_kv_heads}."
+        )
+    if tp_size <= num_kv_heads:
+        if num_kv_heads % tp_size:
+            raise ValueError(
+                f"num_kv_heads={num_kv_heads} must be divisible by tp_size={tp_size}."
+            )
+        kv_head_ids = list(
+            range(
+                tp_rank * (num_kv_heads // tp_size),
+                (tp_rank + 1) * (num_kv_heads // tp_size),
+            )
+        )
+    else:
+        if tp_size % num_kv_heads:
+            raise ValueError(
+                f"tp_size={tp_size} must be divisible by num_kv_heads={num_kv_heads}."
+            )
+        kv_head_ids = [tp_rank // (tp_size // num_kv_heads)]
+    q_head_ids = list(
+        range(
+            tp_rank * (num_heads // tp_size),
+            (tp_rank + 1) * (num_heads // tp_size),
+        )
+    )
+
+    if weight.shape[0] % ckpt_tp:
+        raise ValueError(
+            f"fused qkv_proj has {weight.shape[0]} rows, which cannot be split "
+            f"into {ckpt_tp} checkpoint chunks."
+        )
+    rows_per_chunk = weight.shape[0] // ckpt_tp
+    q_per_chunk = (num_heads // ckpt_tp) * head_dim
+    k_per_chunk = (num_kv_heads // ckpt_tp) * head_dim
+    v_per_chunk = (num_kv_heads // ckpt_tp) * v_head_dim
+    if q_per_chunk + k_per_chunk + v_per_chunk != rows_per_chunk:
+        raise ValueError(
+            f"fused qkv_proj has {weight.shape[0]} rows, not {ckpt_tp} chunks "
+            f"of {q_per_chunk} Q + {k_per_chunk} K + {v_per_chunk} V rows."
+        )
+
+    chunk_scale_rows = math.ceil(rows_per_chunk / block)
+    rows = torch.arange(weight.shape[0], device=weight.device)
+    per_chunk_scales = scale.shape[0] == ckpt_tp * chunk_scale_rows
+    if per_chunk_scales:
+        scale_index = (rows // rows_per_chunk) * chunk_scale_rows + (
+            rows % rows_per_chunk
+        ) // block
+    elif scale.shape[0] == math.ceil(weight.shape[0] / block):
+        scale_index = rows // block
+    else:
+        raise ValueError(
+            f"fused qkv_proj scale has {scale.shape[0]} rows, expected either "
+            f"{ckpt_tp * chunk_scale_rows} or "
+            f"{math.ceil(weight.shape[0] / block)}."
+        )
+
+    if tp_size == ckpt_tp and per_chunk_scales:
+        return (
+            weight.chunk(ckpt_tp, dim=0)[tp_rank],
+            scale.chunk(ckpt_tp, dim=0)[tp_rank],
+        )
+
+    exact_ok = (
+        per_chunk_scales
+        and tp_size < ckpt_tp
+        and ckpt_tp % tp_size == 0
+        and q_per_chunk % block == 0
+        and (kv_chunk_rows or (k_per_chunk % block == 0 and v_per_chunk % block == 0))
+    )
+    if exact_ok:
+        chunks = sorted({head // (num_heads // ckpt_tp) for head in q_head_ids})
+        kv_chunks = sorted({head // (num_kv_heads // ckpt_tp) for head in kv_head_ids})
+        if chunks != kv_chunks:
+            raise ValueError(
+                f"Q checkpoint chunks {chunks} do not match KV chunks {kv_chunks}."
+            )
+        q_end = q_per_chunk
+        k_end = q_per_chunk + k_per_chunk
+
+        def weight_rows(chunk: int, start: int, end: int) -> torch.Tensor:
+            base = chunk * rows_per_chunk
+            return weight[base + start : base + end]
+
+        def scale_rows(chunk: int, start: int, end: int) -> torch.Tensor:
+            base = chunk * chunk_scale_rows
+            return scale[base + start // block : base + math.ceil(end / block)]
+
+        if kv_chunk_rows:
+            pad = kv_chunk_rows - (rows_per_chunk - q_end)
+            weight_parts = [weight_rows(chunk, 0, q_end) for chunk in chunks]
+            for chunk in chunks:
+                kv = weight_rows(chunk, q_end, rows_per_chunk).view(torch.uint8)
+                weight_parts.append(
+                    torch.cat([kv, kv.new_zeros((pad, *kv.shape[1:]))], dim=0).view(
+                        weight.dtype
+                    )
+                )
+            scale_parts = [scale_rows(chunk, 0, q_end) for chunk in chunks] + [
+                scale_rows(chunk, q_end, rows_per_chunk) for chunk in chunks
+            ]
+        else:
+            segments = ((0, q_end), (q_end, k_end), (k_end, rows_per_chunk))
+            weight_parts = [
+                weight_rows(chunk, *segment) for segment in segments for chunk in chunks
+            ]
+            scale_parts = [
+                scale_rows(chunk, *segment) for segment in segments for chunk in chunks
+            ]
+        return (
+            torch.cat([part.view(torch.uint8) for part in weight_parts]).view(
+                weight.dtype
+            ),
+            torch.cat(scale_parts),
+        )
+
+    if kv_chunk_rows:
+        raise ValueError(
+            "the padded [Q | K V pad] gather requires per-chunk scales, "
+            f"tp_size below and dividing ckpt_tp={ckpt_tp}, and whole-block "
+            f"Q rows; got {scale.shape[0]} scale rows at tp_size={tp_size}."
+        )
+
+    q_heads_per_chunk = num_heads // ckpt_tp
+    kv_heads_per_chunk = num_kv_heads // ckpt_tp
+    head_rows = torch.arange(head_dim, device=weight.device)
+    v_head_rows = torch.arange(v_head_dim, device=weight.device)
+    row_index = []
+    for head in q_head_ids:
+        chunk = head // q_heads_per_chunk
+        row_index.append(
+            chunk * rows_per_chunk + (head % q_heads_per_chunk) * head_dim + head_rows
+        )
+    for head in kv_head_ids:
+        chunk = head // kv_heads_per_chunk
+        row_index.append(
+            chunk * rows_per_chunk
+            + q_per_chunk
+            + (head % kv_heads_per_chunk) * head_dim
+            + head_rows
+        )
+    for head in kv_head_ids:
+        chunk = head // kv_heads_per_chunk
+        row_index.append(
+            chunk * rows_per_chunk
+            + q_per_chunk
+            + k_per_chunk
+            + (head % kv_heads_per_chunk) * v_head_dim
+            + v_head_rows
+        )
+    index = torch.cat(row_index)
+    expanded_scale = scale[scale_index[index]].repeat_interleave(block, dim=1)
+    grouped = weight[index].to(torch.float32) * expanded_scale[:, : weight.shape[1]]
+    return _requantize_fp8(grouped, index.numel(), block, weight.dtype)
+
+
+def try_load_mimo_v2_fp8_qkv_proj(
+    module: nn.Module,
+    config,
+    name: str,
+    tensor: torch.Tensor,
+    params_dict: Dict[str, torch.nn.Parameter],
+    pending: Dict[str, Dict[str, torch.Tensor]],
+) -> bool:
+    is_weight = name.endswith("qkv_proj.weight") and tensor.dtype in {
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+    }
+    is_scale = name.endswith("qkv_proj.weight_scale_inv")
+    if not is_weight and not is_scale:
+        return False
+    if name not in params_dict:
+        return True
+    expected_fused_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(config)
+    if expected_fused_tp_size is None:
+        return False
+
+    prefix, kind = name.rsplit(".", 1)
+    if f"{prefix}.weight_scale_inv" not in params_dict:
+        return False
+    entry = pending.setdefault(prefix, {})
+    entry[kind] = tensor
+    if "weight" not in entry or "weight_scale_inv" not in entry:
+        return True
+    del pending[prefix]
+
+    attention = module.get_submodule(prefix.rsplit(".", 1)[0])
+    weight, scale = _shard_fp8_qkv_proj(
+        entry["weight"],
+        entry["weight_scale_inv"],
+        num_heads=attention.total_num_heads,
+        num_kv_heads=attention.total_num_kv_heads,
+        head_dim=attention.head_dim,
+        v_head_dim=attention.v_head_dim,
+        tp_rank=get_parallel().attn_tp_rank,
+        tp_size=get_parallel().attn_tp_size,
+        ckpt_tp=expected_fused_tp_size,
+        kv_chunk_rows=attention.kv_chunk_rows,
+    )
+    for param_name, loaded_tensor in (
+        (f"{prefix}.weight", weight),
+        (f"{prefix}.weight_scale_inv", scale),
+    ):
+        param = params_dict[param_name]
+        if param.shape != loaded_tensor.shape:
+            raise ValueError(
+                f"{param_name}: exact fused-QKV shard has shape "
+                f"{tuple(loaded_tensor.shape)}, expected {tuple(param.shape)}."
+            )
+        default_weight_loader(param, loaded_tensor)
+    return True
+
+
 def load_mimo_v2_qkv_proj_weight(
     name,
     param,
@@ -614,6 +918,7 @@ class MiMoV2Attention(nn.Module):
         max_position_embeddings: int = 32768,
         quant_config: Optional[QuantizationConfig] = None,
         partial_rotary_factor: float = 1.0,
+        fused_qkv_chunks: int = 0,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -646,19 +951,41 @@ class MiMoV2Attention(nn.Module):
 
         self.scaling = self.head_dim**-0.5
 
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
+        self.kv_chunk_rows = _fused_qkv_kv_chunk_rows(
             self.total_num_heads,
             self.total_num_kv_heads,
-            v_head_size=self.v_head_dim,
-            bias=attention_bias,
-            quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-            prefix=add_prefix("qkv_proj", prefix),
-            skip_block_quant_check=True,
+            self.head_dim,
+            self.v_head_dim,
+            attn_tp_size,
+            fused_qkv_chunks,
         )
+        if self.kv_chunk_rows:
+            self.qkv_proj = MergedColumnParallelLinear(
+                hidden_size,
+                [
+                    self.total_num_heads * self.head_dim,
+                    fused_qkv_chunks * self.kv_chunk_rows,
+                ],
+                bias=attention_bias,
+                quant_config=quant_config,
+                tp_rank=attn_tp_rank,
+                tp_size=attn_tp_size,
+                prefix=add_prefix("qkv_proj", prefix),
+            )
+        else:
+            self.qkv_proj = QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                v_head_size=self.v_head_dim,
+                bias=attention_bias,
+                quant_config=quant_config,
+                tp_rank=attn_tp_rank,
+                tp_size=attn_tp_size,
+                prefix=add_prefix("qkv_proj", prefix),
+                skip_block_quant_check=True,
+            )
 
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.v_head_dim,
@@ -719,7 +1046,13 @@ class MiMoV2Attention(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+        q, k, v = _split_qkv(
+            qkv,
+            self.q_size,
+            self.k_size,
+            self.v_size,
+            self.kv_chunk_rows,
+        )
 
         q, k = self.rotary_emb(positions, q, k)
         if self.v_scale is not None:
@@ -746,7 +1079,13 @@ class MiMoV2Attention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+        q, k, v = _split_qkv(
+            qkv,
+            self.q_size,
+            self.k_size,
+            self.v_size,
+            self.kv_chunk_rows,
+        )
 
         # [t, h, dr]
         q, k = self.rotary_emb(positions, q, k)
@@ -787,6 +1126,7 @@ class MiMoV2DecoderLayer(nn.Module):
             "context_len",
             getattr(config, "max_position_embeddings", 32768),
         )
+        fused_qkv_chunks = get_mimo_v2_fused_qkv_chunks(config, quant_config)
 
         if self.is_swa_layer():
             self.self_attn = MiMoV2Attention(
@@ -807,6 +1147,7 @@ class MiMoV2DecoderLayer(nn.Module):
                 max_position_embeddings=max_position_embeddings,
                 quant_config=quant_config,
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
+                fused_qkv_chunks=fused_qkv_chunks,
                 prefix=add_prefix("self_attn", prefix),
             )
         else:
@@ -828,6 +1169,7 @@ class MiMoV2DecoderLayer(nn.Module):
                 max_position_embeddings=max_position_embeddings,
                 quant_config=quant_config,
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
+                fused_qkv_chunks=fused_qkv_chunks,
                 prefix=add_prefix("self_attn", prefix),
             )
 
@@ -1389,16 +1731,11 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         )
 
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, hidden_states_before_norm, aux_hidden_states = self.model(
-                input_ids,
-                positions,
-                forward_batch,
-                input_embeds,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
-        elif self._is_multimodal:
-            hidden_states, hidden_states_before_norm = general_mm_embed_routine(
+        # Multimodal embedding must run even when aux hidden states are captured
+        # (DFLASH/MTP). Taking the capture branch first skipped image/audio
+        # feature placement and left placeholder tokens as plain text embeddings.
+        if self._is_multimodal:
+            model_out = general_mm_embed_routine(
                 input_ids=input_ids,
                 forward_batch=forward_batch,
                 language_model=self.model,
@@ -1407,13 +1744,17 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
         else:
-            hidden_states, hidden_states_before_norm = self.model(
+            model_out = self.model(
                 input_ids,
                 positions,
                 forward_batch,
                 input_embeds,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+        if self.capture_aux_hidden_states:
+            hidden_states, hidden_states_before_norm, aux_hidden_states = model_out
+        else:
+            hidden_states, hidden_states_before_norm = model_out
 
         if self.pp_group.is_last_rank:
             return self.logits_processor(
@@ -1475,6 +1816,9 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         params_dict = dict(self.named_parameters())
         skipped_mtp_weights = False
         deferred_qkv_scale_inv: Dict[str, torch.Tensor] = {}
+        pending_fp8_qkv_proj = getattr(self, "_pending_fp8_qkv_proj", None)
+        if pending_fp8_qkv_proj is None:
+            self._pending_fp8_qkv_proj = pending_fp8_qkv_proj = {}
 
         for name, loaded_weight in weights:
             is_vision_weight = name.startswith(self._VISION_WEIGHT_PREFIXES)
@@ -1607,6 +1951,15 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
 
             # Support fused qkv_proj checkpoint (Pro format)
             if "qkv_proj" in name:
+                if try_load_mimo_v2_fp8_qkv_proj(
+                    self,
+                    self.config,
+                    name,
+                    loaded_weight,
+                    params_dict,
+                    pending_fp8_qkv_proj,
+                ):
+                    continue
                 if name in params_dict:
                     param = params_dict[name]
                     expected_fused_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(

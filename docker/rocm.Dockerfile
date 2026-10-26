@@ -82,7 +82,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="4ad99832823dde2315b361cbd3b54b1c5c12acd5"
+ENV AITER_COMMIT_DEFAULT="2bb549102ba2d9e51da8ef21107361827075d8b6"
 # Pin the ROCm torch stack for every pip invocation in this flavor. The file is
 # filled in after the torch 2.11 upgrade below; it must already exist (empty is
 # valid) because pip reads PIP_CONSTRAINT from the first pip call onwards.
@@ -573,8 +573,14 @@ RUN pip uninstall -y aiter
 RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout -f ${AITER_COMMIT} \
- && git cherry-pick --no-commit 7b481fbcaf834ce98b66004ea329c2ca2bba87d7 \
- && git cherry-pick --no-commit 24a62b1c122f23645a19b9d8b0abd4750c59359b \
+ && if git merge-base --is-ancestor 2bb549102ba2d9e51da8ef21107361827075d8b6 HEAD \
+   && ! git merge-base --is-ancestor aebb81396beff1af809cd26abebacbf1a99729da HEAD; then \
+   git cherry-pick --no-commit aebb81396beff1af809cd26abebacbf1a99729da; \
+    fi \
+ && if ! git merge-base --is-ancestor 2bb549102ba2d9e51da8ef21107361827075d8b6 HEAD; then \
+      git cherry-pick --no-commit 7b481fbcaf834ce98b66004ea329c2ca2bba87d7 \
+      && git cherry-pick --no-commit 24a62b1c122f23645a19b9d8b0abd4750c59359b; \
+    fi \
  && sed -i 's/from functools import lru_cache/from functools import cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && sed -i 's/@lru_cache(maxsize=32)/@cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && git submodule update --init --recursive \

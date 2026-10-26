@@ -42,7 +42,9 @@ from sglang.srt.models.mimo_v2 import (
     MiMoV2Attention,
     MiMoV2ForCausalLM,
     MiMoV2MLP,
+    get_mimo_v2_fused_qkv_chunks,
     load_mimo_v2_qkv_proj_weight,
+    try_load_mimo_v2_fp8_qkv_proj,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
@@ -76,6 +78,7 @@ class MiMoV2MTPLayer(nn.Module):
             "context_len",
             getattr(config, "max_position_embeddings", 32768),
         )
+        fused_qkv_chunks = get_mimo_v2_fused_qkv_chunks(config, quant_config)
 
         self.self_attn = MiMoV2Attention(
             hidden_size=self.hidden_size,
@@ -93,6 +96,7 @@ class MiMoV2MTPLayer(nn.Module):
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
             partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
+            fused_qkv_chunks=fused_qkv_chunks,
             prefix=add_prefix("self_attn", prefix),
         )
         self.is_layer_sparse = False
@@ -291,6 +295,9 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
         ]
 
         params_dict = dict(self.named_parameters())
+        pending_fp8_qkv_proj = getattr(self, "_pending_fp8_qkv_proj", None)
+        if pending_fp8_qkv_proj is None:
+            self._pending_fp8_qkv_proj = pending_fp8_qkv_proj = {}
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
@@ -306,6 +313,15 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
 
             # Support fused qkv_proj checkpoint (Pro format)
             if "qkv_proj" in name:
+                if try_load_mimo_v2_fp8_qkv_proj(
+                    self,
+                    self.config,
+                    name,
+                    loaded_weight,
+                    params_dict,
+                    pending_fp8_qkv_proj,
+                ):
+                    continue
                 if name in params_dict:
                     param = params_dict[name]
                     load_mimo_v2_qkv_proj_weight(
