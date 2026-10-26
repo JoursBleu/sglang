@@ -653,8 +653,9 @@ PY
 # -----------------------
 # Build Mooncake
 ENV PATH=$PATH:/usr/local/go/bin
+ARG ENABLE_MOONCAKE=1
 
-RUN if [ "$BUILD_MOONCAKE" = "1" ]; then \
+RUN if [ "$BUILD_MOONCAKE" = "1" ] && [ "$ENABLE_MOONCAKE" = "1" ]; then \
      apt update && apt install -y zip unzip wget && \
      apt install -y gcc make libtool autoconf  librdmacm-dev rdmacm-utils infiniband-diags ibverbs-utils perftest ethtool  libibverbs-dev rdma-core && \
      apt install -y openssh-server openmpi-bin openmpi-common libopenmpi-dev && \
